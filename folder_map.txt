@@ -1,0 +1,152 @@
+metric_reasoner/
+├─ README.md
+├─ Makefile
+├─ pyproject.toml               # monorepo 툴링(ruff, mypy, pytest), workspace 설정
+├─ .pre-commit-config.yaml
+├─ .env.example
+├─ docker-compose.dev.yml       # 관측/저장/메시지 브로커 올인원 로컬
+├─ k8s/                         # (선택) k8s 매니페스트 or helm charts
+├─ ops/                         # IaC, 배포 스크립트, Terraform 등
+│  ├─ terraform/
+│  ├─ scripts/
+│  └─ grafana_dashboards/
+├─ configs/
+│  ├─ prometheus/
+│  │  └─ prometheus.yml
+│  ├─ loki/
+│  │  └─ loki-config.yml
+│  ├─ promtail/
+│  │  └─ promtail-config.yml
+│  └─ exporters/                # node_exporter, cadvisor 컨피그 템플릿
+├─ libs/                        # 공통 라이브러리(절대중요)
+│  ├─ reasoner_common/          # 공통 유틸, 로깅, 설정, 트레이싱, 리트라이
+│  ├─ reasoner_contracts/       # Pydantic 모델, Avro/Protobuf 스키마, 토픽명 상수
+│  ├─ reasoner_storage/         # Prometheus/Loki/ClickHouse/PG 어댑터
+│  ├─ reasoner_stream/          # Kafka/RabbitMQ/Redis Streams 래퍼
+│  └─ reasoner_ml/              # 피처 추출/윈도우링/스코어 함수(LLM 전 추론)
+├─ collectors/                  # 수집/전송(에이전트/사이드카/스크래퍼)
+│  ├─ cadvisor/                 # docker 배치(외부), 수집 스크립트/리레이
+│  ├─ node_exporter/            # (외부) 설정 템플릿 및 배포 스크립트
+│  ├─ promtail/                 # 로그 테일러 & Loki push
+│  └─ file_tailer/              # 파이썬 로그 테일러(커스텀 필드추출)
+├─ storage/                     # 중앙저장 구성(관측 스택)
+│  ├─ prometheus/               # rule, alert, recording rules
+│  ├─ loki/
+│  └─ grafana/
+├─ pipelines/                   # 배치/주기 분석 (Airflow)
+│  ├─ dags/
+│  │  ├─ metrics_etl_dag.py
+│  │  ├─ rca_batch_dag.py
+│  │  └─ feature_view_refresh_dag.py
+│  └─ docker/airflow/           # Airflow 이미지/에어플로 메타DB
+├─ streaming/                   # 실시간 파이프라인
+│  ├─ producers/
+│  │  └─ metrics_ingestor/      # 실시간 Producer(파싱→정규화→토픽)
+│  ├─ consumers/
+│  │  ├─ anomaly_detector/      # 온라인 이상치 탐지
+│  │  ├─ rootcause_correlator/  # 상관분석/시퀀스 규칙/그래프 연관
+│  │  └─ incident_notifier/     # Slack/Email/PagerDuty 통보
+│  └─ topology.yml              # 스트리밍 토폴로지 문서화
+├─ rca_engine/                  # 근본원인 추론 모듈(규칙+통계+LLM프롬프트 전처리)
+│  ├─ rules/                    # 규칙 YAML/DSL
+│  ├─ features/                 # 파생 피처, 윈도우 집계
+│  └─ engine.py
+├─ services/                    # 외부 서비스 & API
+│  ├─ api_gateway/              # FastAPI: 상태조회/진단결과/재현요청
+│  └─ admin_console/            # (선택) 관리 UI 백엔드
+└─ llm_agent/                   # LangGraph 기반 RCA 대화/자동화
+   ├─ graphs/
+   │  └─ rca_graph.py
+   ├─ tools/
+   │  ├─ fetch_timeseries.py    # Prom/Loki에서 구간 시계열/로그 페치
+   │  ├─ correlate_events.py
+   │  └─ generate_report.py
+   └─ service/main.py           # Agent 서비스(FastAPI/GRPC)
+
+
+   ################################## 신규 버전
+
+   metric_reasoner/
+├─ README.md
+├─ Makefile
+├─ pyproject.toml                  # ruff/mypy/pytest 통합 설정 (workspace)
+├─ .pre-commit-config.yaml
+├─ .env.example
+├─ docker-compose.dev.yml          # Prom+Loki+Grafana+Kafka 로컬
+├─ configs/
+│  ├─ prometheus/prometheus.yml
+│  ├─ loki/loki-config.yml
+│  └─ promtail/promtail-config.yml
+├─ ops/
+│  ├─ scripts/
+│  └─ grafana_dashboards/
+├─ k8s/                            # (선택) 배포 매니페스트
+└─ src/
+   ├─ libs/
+   │  ├─ reasoner_common/
+   │  │  ├─ __init__.py
+   │  │  └─ logging.py
+   │  ├─ reasoner_contracts/
+   │  │  ├─ __init__.py
+   │  │  └─ models.py
+   │  ├─ reasoner_stream/
+   │  │  ├─ __init__.py
+   │  │  └─ kafka.py
+   │  └─ reasoner_storage/
+   │     ├─ __init__.py
+   │     └─ prom.py
+   │
+   ├─ collectors/
+   │  └─ file_tailer/
+   │     ├─ __init__.py
+   │     └─ main.py
+   │
+   ├─ storage/
+   │  ├─ prometheus/   # 룰/알람 템플릿(파이썬은 없음)
+   │  └─ loki/
+   │
+   ├─ streaming/
+   │  ├─ producers/
+   │  │  └─ metrics_ingestor/
+   │  │     ├─ __init__.py
+   │  │     └─ main.py
+   │  └─ consumers/
+   │     ├─ anomaly_detector/
+   │     │  ├─ __init__.py
+   │     │  └─ main.py
+   │     ├─ rootcause_correlator/
+   │     │  ├─ __init__.py
+   │     │  └─ main.py
+   │     └─ incident_notifier/
+   │        ├─ __init__.py
+   │        └─ main.py
+   │
+   ├─ rca_engine/
+   │  ├─ __init__.py
+   │  ├─ rules/
+   │  │  └─ default.yml
+   │  ├─ features/
+   │  │  └─ windows.py
+   │  └─ engine.py
+   │
+   ├─ services/
+   │  ├─ api_gateway/
+   │  │  ├─ __init__.py
+   │  │  └─ main.py
+   │  └─ admin_console/            # 선택
+   │     ├─ __init__.py
+   │     └─ main.py
+   │
+   └─ llm_agent/
+      ├─ __init__.py
+      ├─ graphs/
+      │  ├─ __init__.py
+      │  └─ rca_graph.py
+      ├─ tools/
+      │  ├─ __init__.py
+      │  ├─ fetch_timeseries.py
+      │  ├─ correlate_events.py
+      │  └─ generate_report.py
+      └─ service/
+         ├─ __init__.py
+         └─ main.py
