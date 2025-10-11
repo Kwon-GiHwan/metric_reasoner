@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  # 1) Node 메트릭 (CPU/메모리/디스크/네트워크 등)
+  node-exporter:
+    image: prom/node-exporter:latest
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      # 루트fs 메트릭 경로 보정
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      - --collector.filesystem.fs-types-exclude=^(autofs|proc|sysfs|cgroup|devpts|overlay|nsfs|tmpfs|tracefs|rpc_pipefs|fusectl)$$
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports:
+      - "${NODE_EXPORTER_PORT}:9100"
+    restart: unless-stopped
+
+  # 2) 컨테이너별 메트릭 (cgroup 기준 CPU/메모리/네트워크/블록 IO)
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    ports:
+      - "${CADVISOR_PORT}:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      # containerd 쓰면 아래도 고려
+      # - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+    restart: unless-stopped
+
+  # 3) 초슬림 OTel 로그 에이전트 (filelog → OTLP Push)
+  otel-log-agent:
+    image: otel/opentelemetry-collector:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    environment:
+      OTEL_RESOURCE_ATTRIBUTES: service.name=${OTEL_LOG_AGENT_NAME},deployment.environment=prod
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_COLLECTOR_ENDPOINT}
+    volumes:
+      - ./otel-log-config.yaml:/etc/otelcol/config.yaml:ro
+      - ${APP_LOG_DIR}:${APP_LOG_DIR}:ro
+    restart: unless-stopped

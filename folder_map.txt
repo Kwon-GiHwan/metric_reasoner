@@ -150,3 +150,380 @@ metric_reasoner/
       └─ service/
          ├─ __init__.py
          └─ main.py
+
+
+
+좋아, 현실적인 그림으로 쫙 깔아볼게. 결론부터:
+
+선호 구조: 각 서버에 OTel Collector(Agent) 1개 → 중앙 OTel Collector(Gateway) →
+Loki(로그) + Mimir(메트릭) + Tempo(트레이스) 백엔드(S3/MinIO 스토리지)
+
+(인사이트용) Kafka(버퍼/브로드캐스트) + Spark/Flink 스트리밍 + Iceberg/Delta on S3
+=> 실시간 관측 + 확장/복구 용이 + 배치/ML 분석까지 한 방에.
+
+promtail/fluentd만으로도 수집은 되지만, 세 신호 상관관계(trace_id, 공통 라벨)·정책 일원화·게이트웨이 라우팅·버퍼링 측면에서 OTel 중심이 운영이 훨씬 편해.
+
+1) 추천 아키텍처(온프레 수백 대, 10분마다 대량 유입)
+
+Edge(각 서버 150대)
+
+OTel Collector(Agent):
+
+filelog(오류 로그), hostmetrics(CPU/Mem/Disk/Net), docker_stats or prometheus(cAdvisor/Node Exporter) 수집
+
+공통 라벨 주입: env, service, site_id, host, (+ 가능하면 trace_id 주입)
+
+mTLS로 중앙 게이트웨이에 OTLP gRPC Push
+
+로컬 **file_storage(버퍼)**로 네트워크 장애 시 유실 방지
+
+Core(중앙)
+
+OTel Collector(Gateway): 수신 → 라우팅/샘플링/마스킹
+
+logs → Loki (boltdb-shipper, S3/MinIO backend)
+
+metrics → Mimir (Prometheus Remote Write, S3/MinIO backend)
+
+traces → Tempo (S3/MinIO backend, 필요 시 샘플링)
+
+(선택) Kafka에도 동시 Export(tee) → 실시간 인사이트/ML 파이프라인의 표준 입력
+
+인사이트 계층(스트리밍/배치)
+
+Kafka → Flink/Spark Structured Streaming: 이상 탐지, 상관규칙, Top-K 에러 패턴, 지연 P95 상승 감지 등
+
+결과/피처 저장: Iceberg/Delta 테이블 on S3(Parquet, date/hour/env/service 파티션)
+
+대시보드/탐색: Grafana(LogQL/PromQL/TraceQL) + Athena/Trino(배치 결과 조회)
+
+알림: Alertmanager(메트릭/로그 룰), 필요 시 ML 결과도 웹훅으로 합류
+
+로그를 S3에 직접 원본 보관도 원하면:
+Agent에서 Fluent Bit를 얇게 곁들여 Loki + S3(Parquet) 동시 전송(tee).
+(OTel의 순정 S3 exporter는 약하니 “OTel 중심 + Fluent Bit for S3 tee”가 실전에서 깔끔)
+
+2) 10분당 600만 건 규모 산정(보수/낙관 2안)
+
+입력 속도
+
+6,000,000 건 ÷ 600초 = 10,000 건/초
+
+저장량(대략)
+
+이벤트 1건 저장 시 평균 압축 후 0.3~1.0 KB (메트릭은 더 작고, 로그는 내용 따라 커짐)
+
+1일 이벤트 수: 10,000 × 86,400 = 864,000,000 건/일
+
+케이스별 1일 저장량(GB, 10진 기준):
+
+0.3 KB/건 → 864,000,000 × 0.3 KB = 259.2 GB/일
+
+0.5 KB/건 → 432 GB/일
+
+1.0 KB/건 → 864 GB/일
+
+즉, 핫 데이터 7일만 Loki/Mimir에 두면 약 1.8~6.0 TB,
+장기는 S3 라이프사이클로 Glacier 전환 or Parquet 요약본만 보관을 강력 추천.
+
+네트워크 집계(중앙 수신)
+
+가정 1 KB/건 미압축 유선: 10,000 × 1 KB = ~10 MB/s ≈ 80 Mbps(집계)
+
+TLS/오버헤드, 리플리카 고려 시 100~200 Mbps급 이상은 확보 추천(HA라면 더).
+
+3) 클러스터 러프 사이징(시작점 가이드)
+
+온프레, S3/MinIO 백엔드 사용 가정. 노드는 코어/메모리/디스크 넉넉하게 시작해서 모니터링으로 확장.
+
+Loki
+
+Distributor: 2–3 × (4–8 vCPU / 8–16 GB RAM)
+
+Ingester: 6–8 × (8 vCPU / 32 GB RAM), 로컬 SSD 캐시 200–500 GB
+
+Querier/Query-frontend: 3–4 × (8 vCPU / 16–32 GB RAM)
+
+Memcached(인덱스/쿼리 캐시): 3 × (4 vCPU / 8 GB)
+
+Mimir
+
+Distributor/Ingester/Querier/Store-gateway/Compactor 등 역할별로 8–12노드 총합 시작,
+Ingester 위주로 8 vCPU / 32 GB급, 나머지 4–8 vCPU / 16 GB 권장
+
+오브젝트 스토어 I/O·네트워크 폭에 민감. 초기에 HA MinIO 6–8노드 구성 추천.
+
+Tempo
+
+Ingester/Querier/Compactor/Distributor 각 2–3노드(샘플링 1–10% 가정)
+
+4–8 vCPU / 16–32 GB RAM, S3 I/O 충분히.
+
+Kafka(옵션)
+
+3–5 브로커, NVMe 로컬 디스크(수십만 IOPS급까진 필요 없음), 8 vCPU / 32 GB RAM
+
+토픽: logs_raw, metrics_rollup, trace_events, insight_out 등
+
+리텐션: 생/raw는 짧게(수시간~1일), 요약/피처는 길게
+
+Spark/Flink
+
+Insight 잡 기준 3–6 노드(8–16 vCPU / 32–64 GB RAM), 작업량 따라 auto-scale
+
+배치 + 소규모 스트리밍 혼용(미니배치 1–5분 추천)
+
+시작은 작게(절반) 잡고, Grafana + 백엔드 메트릭 보면서 스케일아웃이 정석.
+(ingester 큐 적체, chunk flush 지연, 99p 쿼리 지연, 리밸런싱 시간 등 지표 감시)
+
+4) 운영 핵심 체크리스트(이거 놓치면 비용 폭탄🚨)
+
+라벨 카디널리티: user_id, request_id는 라벨 금지(필드는 OK) → Loki/Mimir 비용 폭발 방지
+
+트레이스 샘플링: 1–10%로 시작, 에러/슬로우 트레이스는 Always-On
+
+메트릭 다운샘플: 10초/1분/5분 롤업 계층화(쿼리 비용↓)
+
+로그 보존: 핫 7–30일, 오래된 건 S3 Glacier / Parquet 요약본
+
+소용량 파일 문제 해결: Loki chunk 크기/flush 튜닝, S3 multipart, 주기적 compaction
+
+보안: 에이전트↔게이트웨이 mTLS, 중앙 스토리지 IAM/정책, PII 마스킹(Collector processor)
+
+경보 루틴: 메트릭으로 1차 탐지 → 클릭 한 번에 같은 시점 로그/트레이스로 점프(라벨/trace_id 통일 필수)
+
+5) 왜 “OTel 중심”인가?
+
+에이전트 1개로 logs/metrics/traces 일관 수집
+
+trace_id/라벨을 모든 신호에 통일 주입 → 상관관계 분석/Grafana 전환이 클릭 한 번
+
+중앙 게이트웨이에서 샘플링/마스킹/라우팅/버퍼 정책을 한 곳에서 통제
+
+Kafka·S3·벤더 APM 등으로 백엔드 교체/병행이 쉬움(OTLP 표준)
+
+로그를 S3 원본까지 꼭 남기려면: OTel + Fluent Bit(tee to S3 Parquet) 혼용이 베스트.
+
+요약 한 줄
+
+수집: 각 서버 OTel Agent → 중앙 OTel Gateway
+
+저장/관측: Loki(로그) + Mimir(메트릭) + Tempo(트레이스) on S3/MinIO
+
+인사이트: Kafka 스트림 → Spark/Flink → S3(Iceberg) 결과 & Grafana/Athena 시각화
+
+규모감: 10k ev/s, 1일 2.68.6백GB(압축 후) → 7일 핫 1.86TB 수준.
+
+포인트: 라벨 관리·샘플링·다운샘플·보존정책이 비용/성능의 생명줄.
+
+[온프레 서버 x N (예: 150대)]
+ └─ OTel Collector (Agent)
+     - receivers: filelog, hostmetrics, prometheus(=node-exporter/cAdvisor), docker_stats
+     - processors: resource(라벨주입), memory_limiter, batch, (옵션: 마스킹)
+     - exporters: OTLP gRPC → central-lb:4317
+     - buffer: file_storage (망 끊겨도 유실 최소화)
+                │
+                ▼  (mTLS, gRPC/HTTP)
+        ┌───────────────────────────┐
+        │      중앙 Load Balancer   │  ← Nginx/Envoy/ALB 등
+        └──────────┬────────────────┘
+                   ▼
+       ┌───────────────────────────┐     수평 확장(Stateless)
+       │  OTel Collector Gateway 1 │ ─────────┐
+       └───────────────────────────┘          │
+       ┌───────────────────────────┐          │
+       │  OTel Collector Gateway 2 │ ─────────┤
+       └───────────────────────────┘          │
+       ┌───────────────────────────┐          │
+       │  OTel Collector Gateway 3 │ ─────────┘
+       └───────────────────────────┘
+           │ logs            │ metrics                 │ traces
+           ▼                 ▼                         ▼
+      ┌───────────┐   ┌───────────┐              ┌───────────┐
+      │   Loki    │   │  Mimir    │              │   Tempo   │
+      └────┬──────┘   └────┬──────┘              └────┬──────┘
+           │  (index/chunk/blocks)                     │
+           └──────→  S3/MinIO  ←───────────────────────┘
+                          │
+   (옵션) Kafka ←─────────┘  (스트리밍 인사이트/ML 파이프)
+                          │
+                    Iceberg/Delta on S3
+                          │
+                     Spark/Flink/Athena
+                          │
+                      Grafana(실시간) + 리포트/알림
+핵심 포인트: 에이전트는 현장에서 수집/버퍼/경량 전처리만, 중앙 게이트웨이가 라우팅·샘플링·마스킹·백엔드 Fan-out을 담당.
+
+백엔드는 Loki(로그) / Mimir(메트릭) / Tempo(트레이스), 공통 스토리지는 S3/MinIO.
+
+(선택) Kafka로도 tee해서 실시간 인사이트/ML 파이프라인에 공급.
+
+
+[Edge x N] OTel Agent
+   └─ logs/metrics → OTel Gateway → Loki/Mimir/Tempo → S3/MinIO(관측)
+                                     │
+                                     ├────────────────────────┐
+                                     │(tee/export)            │
+                                     ▼                        │
+                            S3 Data Lake (Parquet + Iceberg/Delta)
+                                     │
+                         ┌────────────┴─────────────┐
+                         │   Airflow (10분 배치)    │   <= Control Plane
+                         └───────┬─────────┬────────┘
+                                 │         │
+                      (Spark Batch)   (품질/SLA/컴팩션)
+                                 │
+                     ┌───────────▼───────────┐
+                     │  Insights 테이블(금)   │  Iceberg/Delta
+                     │  lake.insights_10m     │  MERGE/TTL/Optimize
+                     └───────────┬───────────┘
+                                 │
+                 ┌───────────────┼────────────────┐
+                 │               │                │
+            (운영 시각화)   (시스템 연동 푸시)   (추후 스트리밍 전환)
+           Grafana/Athena     RabbitMQ Exchange     Kafka 토픽(옵션)
+           Mimir/Loki 패널     fanout/리트라이       (동일 스키마, 재사용)
+
+
+5) 스케일/성능 가이드 (10분당 600만 건 ≈ 10k EPS 기준)
+
+게이트웨이: 3~5대(8 vCPU / 16–32GB RAM)로 시작 → ingest 대기/큐/지연 모니터링 후 수평확장
+
+Loki: Ingester 6–8대(8 vCPU / 32GB), Querier/Frontend 3–4대(8 vCPU / 16–32GB), Memcached 2–3대
+
+Mimir: Ingester 중심 6–10대(8 vCPU / 32GB), 나머지 4–8 vCPU급 구성
+
+Tempo: 2–3대씩(Distributor/Ingester/Querier/Compactor)로 시작 (샘플링 1–10%)
+
+MinIO/S3: 6–8노드(EC/리플리카), 10–25GbE 권장, NVMe 캐시 도움
+
+네트워크(집계): 100–200 Mbps 이상(오버헤드 포함) 확보 권장
+
+6) 운영 핵심 룰 (진짜 중요!)
+
+라벨 카디널리티 관리: user_id, request_id 라벨 금지(필드는 OK) → 비용 폭탄 방지
+
+트레이스 샘플링: 1–10% + 에러/슬로우 Always-On
+
+메트릭 롤업: 10s/1m/5m 계층 저장 → 쿼리 비용↓
+
+보존정책: 핫 7–30일(Loki/Mimir/Tempo), 장기는 S3 라이프사이클/Glacier 또는 Parquet 요약
+
+보안: 에이전트↔LB↔게이트웨이 mTLS, 스토리지 IAM, 로그 PII 마스킹
+
+알람 루틴: 메트릭 1차 탐지 → Grafana Explore로 동일 trace_id/라벨의 로그/트레이스로 점프
+
+7) 단계적 롤아웃 플랜(짧게)
+
+중앙: MinIO/S3, Loki/Mimir/Tempo, Grafana, LB, Gateway 세팅
+
+파일럿: 서버 5~10대에 Agent 배포 → 라벨/보존/비용 검증
+
+점진 확대: 150대에 배포(Ansible/Helm/DaemonSet) → 스케일 튜닝
+
+(옵션) Kafka + Spark/Flink 추가로 인사이트 앱 배치
+
+Append-only + 소규모 + 단순 리포트만 → Parquet만으로 출발해도 OK.
+
+아래 중 하나라도 해당하면 초기에 Iceberg/Delta부터 가는 게 장기적으로 편함:
+
+여러 잡/팀이 동시에 쓴다(경합/충돌 위험)
+
+업데이트/삭제/머지 필요(중복제거나 GDPR 요구)
+
+시간 여행/스냅샷 롤백을 쓰고 싶다
+
+작은 파일 폭증 예상(10분마다 다수 파일)
+
+Spark 외 Trino/Athena/Presto도 같이
+
+Jira ticket 및 git code 파싱,(RAG로 검색 필수(
+container 명 또느 image 명 기준으로 찾아서
+tracelog 내용에 따른 코드 정보나 jira 정보를 가져와 오류 분석
+
+250920 최종
+
+metric_reasoner/
+├─ README.md
+├─ Makefile
+├─ pyproject.toml                  # ruff/mypy/pytest 통합 설정 (workspace)
+├─ .pre-commit-config.yaml
+├─ .env.example
+├─ docker-compose.dev.yml          # Prom+Loki+Grafana+Kafka 로컬
+├─ configs/
+│  ├─ prometheus/prometheus.yml
+│  ├─ loki/loki-config.yml
+│  └─ promtail/promtail-config.yml
+├─ ops/
+│  ├─ scripts/
+│  └─ grafana_dashboards/
+├─ k8s/                            # (선택) 배포 매니페스트
+└─ src/
+   ├─ libs/
+   │  ├─ reasoner_common/
+   │  │  ├─ __init__.py
+   │  │  └─ logging.py
+   │  ├─ reasoner_contracts/
+   │  │  ├─ __init__.py
+   │  │  └─ models.py
+   │  ├─ reasoner_stream/
+   │  │  ├─ __init__.py
+   │  │  └─ kafka.py
+   │  └─ reasoner_storage/
+   │     ├─ __init__.py
+   │     └─ prom.py
+   │
+   ├─ collectors/
+   │  └─ file_tailer/
+   │     ├─ __init__.py
+   │     └─ main.py
+   │
+   ├─ storage/
+   │  ├─ prometheus/   # 룰/알람 템플릿(파이썬은 없음)
+   │  └─ loki/
+   │
+   ├─ streaming/
+   │  ├─ producers/
+   │  │  └─ metrics_ingestor/
+   │  │     ├─ __init__.py
+   │  │     └─ main.py
+   │  └─ consumers/
+   │     ├─ anomaly_detector/
+   │     │  ├─ __init__.py
+   │     │  └─ main.py
+   │     ├─ rootcause_correlator/
+   │     │  ├─ __init__.py
+   │     │  └─ main.py
+   │     └─ incident_notifier/
+   │        ├─ __init__.py
+   │        └─ main.py
+   │
+   ├─ rca_engine/
+   │  ├─ __init__.py
+   │  ├─ rules/
+   │  │  └─ default.yml
+   │  ├─ features/
+   │  │  └─ windows.py
+   │  └─ engine.py
+   │
+   ├─ services/
+   │  ├─ api_gateway/
+   │  │  ├─ __init__.py
+   │  │  └─ main.py
+   │  └─ admin_console/            # 선택
+   │     ├─ __init__.py
+   │     └─ main.py
+   │
+   └─ llm_agent/
+      ├─ __init__.py
+      ├─ graphs/
+      │  ├─ __init__.py
+      │  └─ rca_graph.py
+      ├─ tools/
+      │  ├─ __init__.py
+      │  ├─ fetch_timeseries.py
+      │  ├─ correlate_events.py
+      │  └─ generate_report.py
+      └─ service/
+         ├─ __init__.py
+         └─ main.py
